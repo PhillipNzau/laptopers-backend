@@ -187,6 +187,19 @@ func ListHubs(cfg *config.Config) gin.HandlerFunc {
 // ---------------- GET ----------------
 func GetHub(cfg *config.Config) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// --- Get authenticated user ID (if available) ---
+		uid := c.GetString("user_id")
+		var userID primitive.ObjectID
+		var hasUser bool
+
+		if uid != "" {
+			var err error
+			userID, err = primitive.ObjectIDFromHex(uid)
+			if err == nil {
+				hasUser = true
+			}
+		}
+
 		hubID, err := primitive.ObjectIDFromHex(c.Param("id"))
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid hub id"})
@@ -222,7 +235,7 @@ func GetHub(cfg *config.Config) gin.HandlerFunc {
 			ID        primitive.ObjectID `json:"id"`
 			UserName  string             `json:"user_name"`
 			Comment   string             `json:"comment"`
-			Rating   	int             `json:"rating"`
+			Rating    int                `json:"rating"`
 			CreatedAt time.Time          `json:"created_at"`
 		}
 
@@ -248,6 +261,16 @@ func GetHub(cfg *config.Config) gin.HandlerFunc {
 			})
 		}
 
+		// --- Check if the current user favorited this hub ---
+		isFavorite := false
+		if hasUser {
+			favColl := cfg.MongoClient.Database(cfg.DBName).Collection("favorites")
+			count, err := favColl.CountDocuments(ctx, bson.M{"hub_id": hubID, "user_id": userID})
+			if err == nil && count > 0 {
+				isFavorite = true
+			}
+		}
+
 		// --- ETag handling ---
 		etag := utils.GenerateETag(hub.ID, hub.UpdatedAt)
 		if match := c.GetHeader("If-None-Match"); match != "" && match == etag {
@@ -258,12 +281,12 @@ func GetHub(cfg *config.Config) gin.HandlerFunc {
 
 		// --- Response ---
 		c.JSON(http.StatusOK, gin.H{
-			"hub":     hub,
-			"reviews": reviews,
+			"hub":        hub,
+			"reviews":    reviews,
+			"is_favorite": isFavorite,
 		})
 	}
 }
-
 
 // ---------------- UPDATE ----------------
 func UpdateHub(cfg *config.Config) gin.HandlerFunc {
@@ -380,7 +403,7 @@ func UpdateHub(cfg *config.Config) gin.HandlerFunc {
 		// ✅ Apply update
 		_, err = col.UpdateOne(ctx, bson.M{"_id": objID}, bson.M{"$set": update})
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not update event"})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not update hub"})
 			return
 		}
 
@@ -393,7 +416,7 @@ func UpdateHub(cfg *config.Config) gin.HandlerFunc {
 
 		c.JSON(http.StatusOK, gin.H{
 			"message": "Hub updated successfully",
-			"event":   updated,
+			"hub":   updated,
 		})
 	}
 }
@@ -434,7 +457,7 @@ func DeleteHub(cfg *config.Config) gin.HandlerFunc {
 			return
 		}
 
-		// ✅ Delete event
+		// ✅ Delete hub
 		res, err := col.DeleteOne(ctx, bson.M{"_id": oid})
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete hub"})
@@ -451,7 +474,7 @@ func DeleteHub(cfg *config.Config) gin.HandlerFunc {
 		}
 
 		c.JSON(http.StatusOK, gin.H{
-			"message": "event deleted successfully",
+			"message": "Hub deleted successfully",
 			"id":      oid.Hex(),
 		})
 	}
@@ -524,18 +547,21 @@ func ToggleFavorite(cfg *config.Config) gin.HandlerFunc {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		// Check if already favorited
+		// ✅ Check if already favorited
 		var fav models.Favorite
 		err = col.FindOne(ctx, bson.M{"user_id": userID, "hub_id": hubID}).Decode(&fav)
 
 		if err == nil {
-			// Unfavorite
+			// ✅ Unfavorite
 			_, _ = col.DeleteOne(ctx, bson.M{"_id": fav.ID})
-			c.JSON(http.StatusOK, gin.H{"message": "removed from favorites"})
+			c.JSON(http.StatusOK, gin.H{
+				"message":  "removed from favorites",
+				"favorite": false, // ← now returns false
+			})
 			return
 		}
 
-		// Add to favorites
+		// ✅ Add to favorites
 		favorite := models.Favorite{
 			ID:        primitive.NewObjectID(),
 			UserID:    userID,
@@ -548,9 +574,13 @@ func ToggleFavorite(cfg *config.Config) gin.HandlerFunc {
 			return
 		}
 
-		c.JSON(http.StatusCreated, gin.H{"message": "added to favorites"})
+		c.JSON(http.StatusOK, gin.H{
+			"message":  "added to favorites",
+			"favorite": true, // ← now returns true
+		})
 	}
 }
+
 
 
 func ListFavorites(cfg *config.Config) gin.HandlerFunc {
