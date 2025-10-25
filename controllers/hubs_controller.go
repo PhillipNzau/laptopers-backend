@@ -108,7 +108,6 @@ func CreateHub(cfg *config.Config) gin.HandlerFunc {
 // ---------------- LIST ----------------
 func ListHubs(cfg *config.Config) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// --- Validate user ID ---
 		uid := c.GetString("user_id")
 		userID, err := primitive.ObjectIDFromHex(uid)
 		if err != nil {
@@ -116,18 +115,21 @@ func ListHubs(cfg *config.Config) gin.HandlerFunc {
 			return
 		}
 
-		col := cfg.MongoClient.Database(cfg.DBName).Collection("hubs")
+		hubCol := cfg.MongoClient.Database(cfg.DBName).Collection("hubs")
+		reviewCol := cfg.MongoClient.Database(cfg.DBName).Collection("reviews")
+		userCol := cfg.MongoClient.Database(cfg.DBName).Collection("users")
+		favCol := cfg.MongoClient.Database(cfg.DBName).Collection("favorites")
+
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
 		// --- Build filter ---
-		filter := bson.M{"user_id": userID}
+		filter := bson.M{}
 		if q := c.Query("q"); q != "" {
 			filter["title"] = bson.M{"$regex": q, "$options": "i"}
 		}
 
-		// --- Fetch data ---
-		cursor, err := col.Find(ctx, filter)
+		cursor, err := hubCol.Find(ctx, filter)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "could not fetch hubs"})
 			return
@@ -139,29 +141,44 @@ func ListHubs(cfg *config.Config) gin.HandlerFunc {
 			return
 		}
 
-		if len(hubs) == 0 {
-			c.JSON(http.StatusOK, []models.Hub{})
-			return
-		}
-
-		// --- Pick the most recently updated hub ---
-		latest := hubs[0]
-		for _, ev := range hubs {
-			if ev.UpdatedAt.After(latest.UpdatedAt) {
-				latest = ev
+		for i, hub := range hubs {
+			// --- Fetch Reviews for this Hub ---
+			var reviews []models.Review
+			reviewCursor, err := reviewCol.Find(ctx, bson.M{"hub_id": hub.ID})
+			if err == nil {
+				_ = reviewCursor.All(ctx, &reviews)
 			}
-		}
 
-		// --- Generate ETag from latest hub ---
-		etag := utils.GenerateETag(latest.ID, latest.UpdatedAt)
-		if match := c.GetHeader("If-None-Match"); match != "" && match == etag {
-			c.Status(http.StatusNotModified)
-			return
-		}
-		c.Header("ETag", etag)
+			// --- Enrich Reviews with User Names ---
+			var reviewResponses []models.ReviewResponse
+			for _, r := range reviews {
+				var user struct {
+					Name string `bson:"name"`
+				}
+				err := userCol.FindOne(ctx, bson.M{"_id": r.UserID}).Decode(&user)
+				username := "Unknown"
+				if err == nil {
+					username = user.Name
+				}
 
-		// --- Add Last-Modified from latest hub ---
-		c.Header("Last-Modified", latest.UpdatedAt.UTC().Format(http.TimeFormat))
+				reviewResponses = append(reviewResponses, models.ReviewResponse{
+					ID:        r.ID,
+					UserID:    r.UserID,
+					UserName:  username,
+					HubID:     r.HubID,
+					Rating:    r.Rating,
+					Comment:   r.Comment,
+					CreatedAt: r.CreatedAt,
+				})
+			}
+
+			// --- Add Reviews to Hub ---
+			hubs[i].Reviews = reviewResponses
+
+			// --- Check if Favorited ---
+			err = favCol.FindOne(ctx, bson.M{"user_id": userID, "hub_id": hub.ID}).Err()
+			hubs[i].IsFavorite = (err == nil)
+		}
 
 		c.JSON(http.StatusOK, hubs)
 	}
@@ -170,32 +187,68 @@ func ListHubs(cfg *config.Config) gin.HandlerFunc {
 // ---------------- GET ----------------
 func GetHub(cfg *config.Config) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		uid := c.GetString("user_id")
-		userID, err := primitive.ObjectIDFromHex(uid)
-		if err != nil {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid user id"})
-			return
-		}
-
 		hubID, err := primitive.ObjectIDFromHex(c.Param("id"))
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid hub id"})
 			return
 		}
 
-		var hub models.Hub
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
+		// --- Fetch the hub (publicly accessible) ---
+		var hub models.Hub
 		err = cfg.MongoClient.Database(cfg.DBName).
 			Collection("hubs").
-			FindOne(ctx, bson.M{"_id": hubID, "user_id": userID}).
+			FindOne(ctx, bson.M{"_id": hubID}).
 			Decode(&hub)
 		if err != nil {
-			c.JSON(http.StatusNotFound, gin.H{"error": "Hub not found or not owned"})
+			c.JSON(http.StatusNotFound, gin.H{"error": "hub not found"})
 			return
 		}
 
+		// --- Fetch reviews for this hub ---
+		reviewColl := cfg.MongoClient.Database(cfg.DBName).Collection("reviews")
+		userColl := cfg.MongoClient.Database(cfg.DBName).Collection("users")
+
+		cursor, err := reviewColl.Find(ctx, bson.M{"hub_id": hubID})
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch reviews"})
+			return
+		}
+		defer cursor.Close(ctx)
+
+		type ReviewResponse struct {
+			ID        primitive.ObjectID `json:"id"`
+			UserName  string             `json:"user_name"`
+			Comment   string             `json:"comment"`
+			Rating   	int             `json:"rating"`
+			CreatedAt time.Time          `json:"created_at"`
+		}
+
+		var reviews []ReviewResponse
+
+		for cursor.Next(ctx) {
+			var review models.Review
+			if err := cursor.Decode(&review); err != nil {
+				continue
+			}
+
+			var user models.User
+			if err := userColl.FindOne(ctx, bson.M{"_id": review.UserID}).Decode(&user); err != nil {
+				user.Name = "Unknown User"
+			}
+
+			reviews = append(reviews, ReviewResponse{
+				ID:        review.ID,
+				UserName:  user.Name,
+				Comment:   review.Comment,
+				Rating:    review.Rating,
+				CreatedAt: review.CreatedAt,
+			})
+		}
+
+		// --- ETag handling ---
 		etag := utils.GenerateETag(hub.ID, hub.UpdatedAt)
 		if match := c.GetHeader("If-None-Match"); match != "" && match == etag {
 			c.Status(http.StatusNotModified)
@@ -203,9 +256,14 @@ func GetHub(cfg *config.Config) gin.HandlerFunc {
 		}
 		c.Header("ETag", etag)
 
-		c.JSON(http.StatusOK, hub)
+		// --- Response ---
+		c.JSON(http.StatusOK, gin.H{
+			"hub":     hub,
+			"reviews": reviews,
+		})
 	}
 }
+
 
 // ---------------- UPDATE ----------------
 func UpdateHub(cfg *config.Config) gin.HandlerFunc {
@@ -399,3 +457,145 @@ func DeleteHub(cfg *config.Config) gin.HandlerFunc {
 	}
 }
 
+func AddReview(cfg *config.Config) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		userIDHex := c.GetString("user_id")
+		userID, err := primitive.ObjectIDFromHex(userIDHex)
+		if err != nil {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid user id"})
+			return
+		}
+
+		hubID, err := primitive.ObjectIDFromHex(c.Param("id"))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid hub id"})
+			return
+		}
+
+		var input struct {
+			Rating  int    `json:"rating" binding:"required,min=1,max=5"`
+			Comment string `json:"comment"`
+		}
+		if err := c.ShouldBindJSON(&input); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+
+		review := models.Review{
+			ID:        primitive.NewObjectID(),
+			UserID:    userID,
+			HubID:     hubID,
+			Rating:    input.Rating,
+			Comment:   input.Comment,
+			CreatedAt: time.Now(),
+			UpdatedAt: time.Now(),
+		}
+
+		col := cfg.MongoClient.Database(cfg.DBName).Collection("reviews")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if _, err := col.InsertOne(ctx, review); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "could not add review"})
+			return
+		}
+
+		c.JSON(http.StatusCreated, review)
+	}
+}
+
+
+func ToggleFavorite(cfg *config.Config) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		userIDHex := c.GetString("user_id")
+		userID, err := primitive.ObjectIDFromHex(userIDHex)
+		if err != nil {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid user id"})
+			return
+		}
+
+		hubID, err := primitive.ObjectIDFromHex(c.Param("id"))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid hub id"})
+			return
+		}
+
+		col := cfg.MongoClient.Database(cfg.DBName).Collection("favorites")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		// Check if already favorited
+		var fav models.Favorite
+		err = col.FindOne(ctx, bson.M{"user_id": userID, "hub_id": hubID}).Decode(&fav)
+
+		if err == nil {
+			// Unfavorite
+			_, _ = col.DeleteOne(ctx, bson.M{"_id": fav.ID})
+			c.JSON(http.StatusOK, gin.H{"message": "removed from favorites"})
+			return
+		}
+
+		// Add to favorites
+		favorite := models.Favorite{
+			ID:        primitive.NewObjectID(),
+			UserID:    userID,
+			HubID:     hubID,
+			CreatedAt: time.Now(),
+		}
+
+		if _, err := col.InsertOne(ctx, favorite); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "could not mark as favorite"})
+			return
+		}
+
+		c.JSON(http.StatusCreated, gin.H{"message": "added to favorites"})
+	}
+}
+
+
+func ListFavorites(cfg *config.Config) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		userIDHex := c.GetString("user_id")
+		userID, err := primitive.ObjectIDFromHex(userIDHex)
+		if err != nil {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid user id"})
+			return
+		}
+
+		favCol := cfg.MongoClient.Database(cfg.DBName).Collection("favorites")
+		hubCol := cfg.MongoClient.Database(cfg.DBName).Collection("hubs")
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		cursor, err := favCol.Find(ctx, bson.M{"user_id": userID})
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch favorites"})
+			return
+		}
+
+		var favs []models.Favorite
+		if err := cursor.All(ctx, &favs); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "could not decode favorites"})
+			return
+		}
+
+		hubIDs := []primitive.ObjectID{}
+		for _, f := range favs {
+			hubIDs = append(hubIDs, f.HubID)
+		}
+
+		cursor, err = hubCol.Find(ctx, bson.M{"_id": bson.M{"$in": hubIDs}})
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch hubs"})
+			return
+		}
+
+		var hubs []models.Hub
+		if err := cursor.All(ctx, &hubs); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "could not decode hubs"})
+			return
+		}
+
+		c.JSON(http.StatusOK, hubs)
+	}
+}

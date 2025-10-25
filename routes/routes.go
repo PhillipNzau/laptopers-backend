@@ -42,6 +42,8 @@ func SetupRoutes(r *gin.Engine, cfg *config.Config) {
 	hubs.Use(auth)
 	{
 		hubs.POST("", controllers.CreateHub(cfg))
+		hubs.POST("/:id/reviews", controllers.AddReview(cfg))
+		hubs.POST("/:id/favorite", controllers.ToggleFavorite(cfg))
 		hubs.GET("", controllers.ListHubs(cfg))
 		hubs.GET("/:id", controllers.GetHub(cfg))
 		hubs.PATCH("/:id", controllers.UpdateHub(cfg))
