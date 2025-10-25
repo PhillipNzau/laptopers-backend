@@ -38,25 +38,16 @@ func SetupRoutes(r *gin.Engine, cfg *config.Config) {
 	}
 
 	// Events
-	events := r.Group("/events")
-	events.Use(auth)
+	hubs := r.Group("/hubs")
+	hubs.Use(auth)
 	{
-		events.POST("", controllers.CreateEvent(cfg))
-		events.GET("", controllers.ListEvents(cfg))
-		events.GET("/:id", controllers.GetEvent(cfg))
-		events.PATCH("/:id", controllers.UpdateEvent(cfg))
-		events.DELETE("/:id", controllers.DeleteEvent(cfg))
+		hubs.POST("", controllers.CreateHub(cfg))
+		hubs.GET("", controllers.ListHubs(cfg))
+		hubs.GET("/:id", controllers.GetHub(cfg))
+		hubs.PATCH("/:id", controllers.UpdateHub(cfg))
+		hubs.DELETE("/:id", controllers.DeleteHub(cfg))
 	}
 
-	// Contributions
-	contribs := r.Group("/contributions")
-	contribs.Use(auth)
-	{
-		contribs.POST("", controllers.CreateContribution(cfg))
-		contribs.GET("", controllers.ListContributions(cfg))
-		contribs.GET("/:id", controllers.GetContribution(cfg))
-		contribs.PATCH("/:id", controllers.UpdateContribution(cfg))
-		contribs.DELETE("/:id", controllers.DeleteContribution(cfg))
-	}
+
 
 }
