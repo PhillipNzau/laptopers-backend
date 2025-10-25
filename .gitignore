@@ -1,0 +1,27 @@
+# Root-level ignores
+.DS_Store
+*.log
+.env
+.env.*  # like .env.local, .env.production, etc.
+*.swp
+*.swo
+
+# Ignore Go build files and artifacts in 
+bin
+build
+*.exe
+*.exe~
+*.out
+*.test
+coverage.*
+.idea/
+.vscode/
+# go.sum
+go.mod~
+
+# Optional: ignore test result files
+testdata/
+
+
+# Optional: OS-specific files
+Thumbs.db
